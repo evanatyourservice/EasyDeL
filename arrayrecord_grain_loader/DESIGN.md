@@ -234,3 +234,27 @@ change. Validation: syntax (py_compile) + glue verified vs real signatures + the
 benchmark above. Remaining: full distillation trainer smoke on v4-128 to read the trainer's own
 data_collection_time (confirmatory; the benchmark already establishes data-wait≈0). Resume/seek
 (grain checkpointing) and full-vlm_v2 conversion are the next iteration.
+
+## Completeness pass (per Evan/orch) — checklist
+
+| # | Dimension | Status | Evidence / note |
+|---|-----------|--------|-----------------|
+| 1 | **Weighted mixture** | ✅ COVERED | Re-architected to grain best practice: each dataset = its OWN ArrayRecord set → `MapDataset.source().shuffle()` → `MapDataset.mix(weights)`. Proven controllable: target 0.4/0.3/0.2/0.1 → observed **exactly** 0.4/0.3/0.2/0.1 (size-proportional would be 0.18/0.18/0.16/0.49). Weights plumbed via `arrayrecord_train_datasets={name:files}` + `arrayrecord_mixture_weights={name:w}` (mirrors the existing `mixture_weights`). NOT a single concatenated uniform shuffle. |
+| 2 | **Multi-image** | ✅ COVERED | `FineVision__mimic_cgd` (2 img/row): 24 rows, **0** per-image-SHA mismatches; collate scatters **multiple spans/sample** — 2-img row = 98 placeholders = 98 embed tok, batch (392,5120) byte-exact vs parquet. n_images up to 3 present (AgentNet, GUI-Net) — same per-image list mechanism. |
+| 3 | **Packed sequences** | ✅ (per-batch) | `data_collator` = EmbedsWindowPacker→collate_packed_embeds (per-batch packing) runs as the grain `batch_fn`. MFU/density reported for visibility only; not over-optimized (data-faster-than-training is the bar). Knobs if ever needed: larger packing unit / soft length-grouping per bucket. |
+| 4 | **group_size vs throughput** | ✅ group_size=1 holds | group_size=1 (max random access / global shuffle). Sustains ~30–37 rows/s, ~195 MB/s from gs:// → 24–102× over the ~22s step, data-wait≈0. No need for grouping; if reads ever lag at full fan-out, group_size 8–16 is the fallback (trades shuffle granularity for fewer seeks). |
+| 5a | Per-host sharding | ✅ COVERED | `mixed.slice(slice(process_index, None, process_count))` — deterministic, disjoint strides verified. |
+| 5b | Index resume | ✅ native | grain `IterDataset` is index/checkpointable (grain.checkpoint) — seek by index, no row materialization. (Wiring exposes it; resume hook is a follow-up knob.) |
+| 5c | Determinism / seed | ✅ COVERED | per-dataset `.shuffle(seed=shuffle_seed_train + i)`; same seed → same global order. |
+| 5d | Prefetch / threads | ✅ COVERED | `to_iter_dataset(ReadOptions(num_threads, prefetch_buffer_size))` (config: `arrayrecord_num_threads`/`arrayrecord_prefetch_buffer`). |
+
+### Weighted-mix architecture (final)
+```
+per dataset:  MapDataset.source(ArrayRecordDataSource(files)).shuffle(seed+i)
+mixture:      MapDataset.mix(per_ds, weights=[w_i])          # controllable weights
+per host:     .slice(slice(process_index, None, process_count))
+epochs:       .repeat(num_train_epochs)                       # mix len = min_i(size_i / w_i)
+decode+batch: .map(MsgpackDecode()).batch(B, drop_remainder=True, batch_fn=data_collator)
+drive:        .to_iter_dataset(ReadOptions(num_threads, prefetch_buffer_size))
+```
+**Conversion layout consequence:** the full vlm_v2 conversion writes **one ArrayRecord set per dataset** (per `source=`), NOT one concatenated set — so weights stay controllable. `mix` length is bounded by the most-constrained `size_i/w_i`; `repeat` cycles. group_size=1, msgpack rows, bf16 blobs verbatim (as in the sample convert).

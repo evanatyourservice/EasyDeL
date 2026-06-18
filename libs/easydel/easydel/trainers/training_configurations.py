@@ -884,6 +884,26 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Optional ``.array_record`` files for evaluation (same pipeline as train)."},
     )
+    arrayrecord_train_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={
+            "help": "Per-dataset ArrayRecord sets for WEIGHTED mixing: ``{name: path/glob/list}``. Each "
+            "dataset is loaded + shuffled independently, then combined with ``grain.MapDataset.mix`` using "
+            "``arrayrecord_mixture_weights`` -> weighted AND globally shuffled (controllable weights, NOT "
+            "size-proportional). Takes precedence over ``arrayrecord_train_files``."
+        },
+    )
+    arrayrecord_eval_datasets: dict[str, str | list[str]] | None = field(
+        default=None,
+        metadata={"help": "Per-dataset ArrayRecord sets for evaluation weighted mixing (same as train)."},
+    )
+    arrayrecord_mixture_weights: dict[str, float] | None = field(
+        default=None,
+        metadata={
+            "help": "Mixing weights ``{name: weight}`` for ``arrayrecord_train_datasets`` "
+            "(grain.MapDataset.mix). None -> weight by dataset size (size-proportional)."
+        },
+    )
     arrayrecord_num_threads: int = field(
         default=16,
         metadata={"help": "grain ReadOptions.num_threads for ArrayRecord reads (parallel prefetch)."},

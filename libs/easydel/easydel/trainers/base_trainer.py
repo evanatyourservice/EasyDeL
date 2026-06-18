@@ -5320,7 +5320,9 @@ class BaseTrainer(BaseTrainerProtocol):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
-        if getattr(self.arguments, "arrayrecord_train_files", None):
+        if getattr(self.arguments, "arrayrecord_train_files", None) or getattr(
+            self.arguments, "arrayrecord_train_datasets", None
+        ):
             return self._configure_arrayrecord_dataloader()
         if self.arguments.use_grain:
             return self._configure_grain_dataloader()
@@ -5330,23 +5332,32 @@ class BaseTrainer(BaseTrainerProtocol):
     def _configure_arrayrecord_dataloader(self) -> TrainerConfigureDataloaderOutput:
         """Configure a grain ArrayRecord dataloader for the precomputed VL pack.
 
-        Builds ``ArrayRecordDataSource`` (native ``gs://`` random access) ->
-        ``IndexSampler(shuffle=...)`` (TRUE global permutation + per-host shard via
-        ``ShardOptions``) -> ``[MsgpackDecode(), Batch(B, batch_fn=data_collator)]``.
-        ``Batch``'s ``batch_fn`` runs the user ``data_collator`` (the VL packed-embeds
-        collator) on each group of ``B`` decoded rows, so the loader yields already
-        collated batch dicts; the training loop's ``_apply_user_data_collator`` no-ops
-        on a dict, avoiding double collation.
+        Architecture (grain best practice for a weighted, globally-shuffled mixture):
+        each dataset is its OWN ArrayRecord set, loaded as a ``MapDataset`` and shuffled
+        independently, then combined with ``grain.MapDataset.mix(weights)`` so the
+        mixture weights are preserved and CONTROLLABLE (not merely size-proportional).
+        The mixed stream is sharded per host (``slice(shard_index, None, shard_count)``,
+        deterministic + disjoint), ``MsgpackDecode``-d, and grouped by ``batch`` whose
+        ``batch_fn`` is the user ``data_collator`` (the VL packed-embeds collator), so
+        the loader yields already-collated batch dicts; the training loop's
+        ``_apply_user_data_collator`` no-ops on a dict, avoiding double collation.
+        ``.to_iter_dataset(read_options=...)`` drives native ``gs://`` random-access reads
+        with parallel prefetch.
+
+        A single ``arrayrecord_train_files`` source is handled as a one-dataset mixture
+        (uniform / size-proportional). ``mix`` length is ``min_i(size_i / weight_i)`` —
+        one epoch ends when the most-constrained dataset would be exhausted; ``repeat``
+        cycles for ``num_train_epochs``.
 
         Empirically the loader sustains far above the step rate (no data-starved steps);
-        see ``arrayrecord_grain_loader/`` for the throughput benchmark.
+        see ``arrayrecord_grain_loader/`` for the throughput + weighted-mix proofs.
         """
         from easydel.data.sources.base import expand_data_files
 
         if self.data_collator is None:
             raise ValueError(
-                "arrayrecord_train_files requires an explicit `data_collator` (the VL packed-embeds "
-                "collator) — it is used as the grain.Batch batch_fn."
+                "arrayrecord_train_files/_datasets requires an explicit `data_collator` (the VL "
+                "packed-embeds collator) — it is used as the grain batch_fn."
             )
 
         shard_index = (
@@ -5356,47 +5367,60 @@ class BaseTrainer(BaseTrainerProtocol):
             self.arguments.grain_shard_count if self.arguments.grain_shard_count is not None else jax.process_count()
         )
 
-        def _build(files, batch_size, *, is_train):
-            shard_options = grain.ShardOptions(shard_index=shard_index, shard_count=shard_count, drop_remainder=True)
-            source = grain.ArrayRecordDataSource(expand_data_files(files))
+        def _build(datasets: dict, weights: dict | None, batch_size, *, is_train):
+            seed = self.arguments.shuffle_seed_train if is_train else 0
+            do_shuffle = self.arguments.shuffle_train_dataset if is_train else False
             num_epochs = self.arguments.num_train_epochs if is_train else 1
-            sampler = grain.IndexSampler(
-                num_records=len(source),
-                shard_options=shard_options,
-                seed=(self.arguments.shuffle_seed_train if is_train else 0),
-                num_epochs=num_epochs,
-                shuffle=(self.arguments.shuffle_train_dataset if is_train else False),
+
+            per_ds, ws = [], []
+            for i, name in enumerate(sorted(datasets)):
+                source = grain.ArrayRecordDataSource(expand_data_files(datasets[name]))
+                ds = grain.MapDataset.source(source)
+                if do_shuffle:
+                    ds = ds.shuffle(seed=seed + i)
+                per_ds.append(ds)
+                ws.append(float(weights[name]) if (weights and name in weights) else float(len(source)))
+
+            mixed = grain.MapDataset.mix(per_ds, weights=ws) if len(per_ds) > 1 else per_ds[0]
+            if num_epochs and num_epochs > 1:
+                mixed = mixed.repeat(num_epochs)
+            if shard_count > 1:
+                mixed = mixed.slice(slice(shard_index, None, shard_count))
+
+            pipeline = mixed.map(MsgpackDecode()).batch(
+                batch_size=batch_size, drop_remainder=True, batch_fn=self.data_collator
             )
-            loader = grain.DataLoader(
-                data_source=source,
-                sampler=sampler,
-                operations=[
-                    MsgpackDecode(),
-                    grain.Batch(batch_size=batch_size, drop_remainder=True, batch_fn=self.data_collator),
-                ],
-                worker_count=self.arguments.arrayrecord_worker_count,
-                worker_buffer_size=2,
+            steps = len(pipeline)
+            iterable = pipeline.to_iter_dataset(
                 read_options=grain.ReadOptions(
                     num_threads=self.arguments.arrayrecord_num_threads,
                     prefetch_buffer_size=self.arguments.arrayrecord_prefetch_buffer,
-                ),
+                )
             )
-            # per-host steps after sharding + drop_remainder, across all epochs
-            per_host = len(source) // shard_count
-            steps = (per_host // batch_size) * num_epochs
-            return _ReiterableDataLoader(factory=lambda: iter(loader), length=steps), steps
+            return _ReiterableDataLoader(factory=lambda: iter(iterable), length=steps), steps
 
+        def _resolve(datasets_attr, files_attr):
+            datasets = getattr(self.arguments, datasets_attr, None)
+            if datasets:
+                return dict(datasets), self.arguments.arrayrecord_mixture_weights
+            files = getattr(self.arguments, files_attr, None)
+            if files:
+                return {"_default": files}, None
+            return None, None
+
+        train_datasets, train_weights = _resolve("arrayrecord_train_datasets", "arrayrecord_train_files")
         dataloader_train, max_training_steps = _build(
-            self.arguments.arrayrecord_train_files, self.training_batch_size, is_train=True
+            train_datasets, train_weights, self.training_batch_size, is_train=True
         )
         self._set_dataset_size_metadata(
             is_train=True, resolution=_ResolvedStepCount(max_training_steps, None, False, "arrayrecord", True, False)
         )
 
         dataloader_eval, max_evaluation_steps = None, 0
-        if getattr(self.arguments, "arrayrecord_eval_files", None) and self.arguments.do_eval:
+        eval_datasets, eval_weights = _resolve("arrayrecord_eval_datasets", "arrayrecord_eval_files")
+        if eval_datasets and self.arguments.do_eval:
             dataloader_eval, max_evaluation_steps = _build(
-                self.arguments.arrayrecord_eval_files, self.evaluation_batch_size, is_train=False
+                eval_datasets, eval_weights, self.evaluation_batch_size, is_train=False
             )
 
         return TrainerConfigureDataloaderOutput(

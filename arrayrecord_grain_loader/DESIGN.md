@@ -170,3 +170,42 @@ Byte-exact verify: **0/410** blob-SHA mismatches across parquet→msgpack→arra
 
 Note: `image_token_id=248056` is auto-detected from the data. `collate_embeds_pack`'s
 `max_total` is the **embed-row capacity** (Σ `embed_n_tok` over the batch), not the seq len.
+
+## Data-wait benchmark (the acceptance bar: loader >= step rate, no starvation)
+
+`bench_throughput.py` — full production op chain (msgpack-decode → per-batch pack
+collate) reading `.array_record` straight from `gs://` under TRUE global shuffle
+(worst-case random access), grain parallel prefetch, single host, worker_count=0.
+gs:// reads work NATIVELY in array_record (no gcsfuse): source open 0.74s, cold random
+1.8MB record read 0.29s single-thread.
+
+Sustained ~35–37 rows/s, ~195 MB/s (read/decode-bound; flat across num_threads 4–32):
+
+| batch rows | ms/batch | data-wait/step @22s | headroom |
+|---|---|---|---|
+| 8  | 215 | 0.00s | 102× |
+| 16 | 431 | 0.00s | 51× |
+| 32 | 912 | 0.00s | 24× |
+
+Conclusion: data-wait ≈ 0 with 24–102× headroom over the ~22s step even single-host /
+conservative. Starvation would need ~770 rows/step on ONE host; production = 16 hosts,
+each loader feeds only its own IndexSampler shard, so per-host headroom holds (aggregate
+read BW scales ~16×). worker_count>0 (multiprocess) is available for more if ever needed.
+Caveat: 195 MB/s is the head CPU VM's plateau; TPU pod hosts likely read faster. MFU
+(packing density) is secondary per Evan and not optimized here.
+
+## Production wiring recipe (Option A, proven by the benchmark)
+
+```python
+src  = grain.python.ArrayRecordDataSource(gs_files)          # native gs://, random access
+samp = grain.python.IndexSampler(num_records=len(src),
+          shard_options=grain.python.ShardOptions(process_index, process_count, drop_remainder=True),
+          shuffle=True, seed=..., num_epochs=...)             # TRUE global shuffle + per-host shard
+dl   = grain.python.DataLoader(data_source=src, sampler=samp,
+          operations=[MsgpackDecode(),                        # bytes -> row dict (new MapTransform)
+                      grain.python.Batch(B, drop_remainder=True, batch_fn=collate)],  # Batch-then-collate
+          worker_count=W, worker_buffer_size=2,
+          read_options=grain.python.ReadOptions(num_threads=16, prefetch_buffer_size=64))
+```
+`grain.python.Batch` accepts `batch_fn`, so VL packing (many-rows→one-batch) fits without
+a bespoke stage — unlike the existing per-row grain path (`base_trainer.py:5034-5044`).

@@ -5337,12 +5337,12 @@ class BaseTrainer(BaseTrainerProtocol):
         independently, then combined with ``grain.MapDataset.mix(weights)`` so the
         mixture weights are preserved and CONTROLLABLE (not merely size-proportional).
         The mixed stream is sharded per host (``slice(shard_index, None, shard_count)``,
-        deterministic + disjoint), ``MsgpackDecode``-d, and grouped by ``batch`` whose
-        ``batch_fn`` is the user ``data_collator`` (the VL packed-embeds collator), so
-        the loader yields already-collated batch dicts; the training loop's
-        ``_apply_user_data_collator`` no-ops on a dict, avoiding double collation.
-        ``.to_iter_dataset(read_options=...)`` drives native ``gs://`` random-access reads
-        with parallel prefetch.
+        deterministic + disjoint), ``MsgpackDecode``-d, and grouped by ``batch`` into a
+        LIST of ``batch_size`` row dicts (``batch_fn=list``, uncollated). The trainer's
+        prefetcher applies ``self._data_collator`` (the VL packed-embeds collator) to that
+        list — same contract as the ShardedDataSource path — so collation happens exactly
+        once. ``.to_iter_dataset(read_options=...)`` drives native ``gs://`` random-access
+        reads with parallel prefetch.
 
         A single ``arrayrecord_train_files`` source is handled as a one-dataset mixture
         (uniform / size-proportional). ``mix`` length is ``min_i(size_i / weight_i)`` —
@@ -5357,7 +5357,7 @@ class BaseTrainer(BaseTrainerProtocol):
         if self.data_collator is None:
             raise ValueError(
                 "arrayrecord_train_files/_datasets requires an explicit `data_collator` (the VL "
-                "packed-embeds collator) — it is used as the grain batch_fn."
+                "packed-embeds collator) — the trainer applies it to each list batch the loader yields."
             )
 
         shard_index = (
@@ -5387,9 +5387,12 @@ class BaseTrainer(BaseTrainerProtocol):
             if shard_count > 1:
                 mixed = mixed.slice(slice(shard_index, None, shard_count))
 
-            pipeline = mixed.map(MsgpackDecode()).batch(
-                batch_size=batch_size, drop_remainder=True, batch_fn=self.data_collator
-            )
+            # Yield a LIST of `batch_size` row dicts (uncollated). The trainer's prefetcher
+            # (`_PrefetchLoader._load`) applies ``self._data_collator`` to the dataloader's
+            # output, exactly like the ShardedDataSource path (`_create_dataloader_from_source`
+            # yields lists too). Collating here with `batch_fn=data_collator` would DOUBLE
+            # collate (the prefetcher re-applies the collator to the already-collated dict).
+            pipeline = mixed.map(MsgpackDecode()).batch(batch_size=batch_size, drop_remainder=True, batch_fn=list)
             steps = len(pipeline)
             iterable = pipeline.to_iter_dataset(
                 read_options=grain.ReadOptions(

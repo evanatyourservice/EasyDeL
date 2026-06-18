@@ -106,7 +106,7 @@ from .training_utils import (
     normalize_generation_model_kwargs,
     prepare_generation_model_kwargs_for_call,
 )
-from .utils import CollateMapTransform, HFDataSource, ToNumpy
+from .utils import CollateMapTransform, HFDataSource, MsgpackDecode, ToNumpy
 
 try:
     import wandb
@@ -5320,10 +5320,91 @@ class BaseTrainer(BaseTrainerProtocol):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
+        if getattr(self.arguments, "arrayrecord_train_files", None):
+            return self._configure_arrayrecord_dataloader()
         if self.arguments.use_grain:
             return self._configure_grain_dataloader()
         else:
             return self._configure_tfds_dataloader()
+
+    def _configure_arrayrecord_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Configure a grain ArrayRecord dataloader for the precomputed VL pack.
+
+        Builds ``ArrayRecordDataSource`` (native ``gs://`` random access) ->
+        ``IndexSampler(shuffle=...)`` (TRUE global permutation + per-host shard via
+        ``ShardOptions``) -> ``[MsgpackDecode(), Batch(B, batch_fn=data_collator)]``.
+        ``Batch``'s ``batch_fn`` runs the user ``data_collator`` (the VL packed-embeds
+        collator) on each group of ``B`` decoded rows, so the loader yields already
+        collated batch dicts; the training loop's ``_apply_user_data_collator`` no-ops
+        on a dict, avoiding double collation.
+
+        Empirically the loader sustains far above the step rate (no data-starved steps);
+        see ``arrayrecord_grain_loader/`` for the throughput benchmark.
+        """
+        from easydel.data.sources.base import expand_data_files
+
+        if self.data_collator is None:
+            raise ValueError(
+                "arrayrecord_train_files requires an explicit `data_collator` (the VL packed-embeds "
+                "collator) — it is used as the grain.Batch batch_fn."
+            )
+
+        shard_index = (
+            self.arguments.grain_shard_index if self.arguments.grain_shard_index is not None else jax.process_index()
+        )
+        shard_count = (
+            self.arguments.grain_shard_count if self.arguments.grain_shard_count is not None else jax.process_count()
+        )
+
+        def _build(files, batch_size, *, is_train):
+            shard_options = grain.ShardOptions(shard_index=shard_index, shard_count=shard_count, drop_remainder=True)
+            source = grain.ArrayRecordDataSource(expand_data_files(files))
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            sampler = grain.IndexSampler(
+                num_records=len(source),
+                shard_options=shard_options,
+                seed=(self.arguments.shuffle_seed_train if is_train else 0),
+                num_epochs=num_epochs,
+                shuffle=(self.arguments.shuffle_train_dataset if is_train else False),
+            )
+            loader = grain.DataLoader(
+                data_source=source,
+                sampler=sampler,
+                operations=[
+                    MsgpackDecode(),
+                    grain.Batch(batch_size=batch_size, drop_remainder=True, batch_fn=self.data_collator),
+                ],
+                worker_count=self.arguments.arrayrecord_worker_count,
+                worker_buffer_size=2,
+                read_options=grain.ReadOptions(
+                    num_threads=self.arguments.arrayrecord_num_threads,
+                    prefetch_buffer_size=self.arguments.arrayrecord_prefetch_buffer,
+                ),
+            )
+            # per-host steps after sharding + drop_remainder, across all epochs
+            per_host = len(source) // shard_count
+            steps = (per_host // batch_size) * num_epochs
+            return _ReiterableDataLoader(factory=lambda: iter(loader), length=steps), steps
+
+        dataloader_train, max_training_steps = _build(
+            self.arguments.arrayrecord_train_files, self.training_batch_size, is_train=True
+        )
+        self._set_dataset_size_metadata(
+            is_train=True, resolution=_ResolvedStepCount(max_training_steps, None, False, "arrayrecord", True, False)
+        )
+
+        dataloader_eval, max_evaluation_steps = None, 0
+        if getattr(self.arguments, "arrayrecord_eval_files", None) and self.arguments.do_eval:
+            dataloader_eval, max_evaluation_steps = _build(
+                self.arguments.arrayrecord_eval_files, self.evaluation_batch_size, is_train=False
+            )
+
+        return TrainerConfigureDataloaderOutput(
+            dataloader_train=dataloader_train,
+            max_training_steps=max_training_steps,
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps,
+        )
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         """

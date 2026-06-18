@@ -2294,6 +2294,26 @@ class ToNumpy(pygrain.MapTransform):
         return element
 
 
+@dataclass
+class MsgpackDecode(pygrain.MapTransform):
+    """Grain transform decoding a raw ``.array_record`` record into a row dict.
+
+    Each record produced by the ArrayRecord VL pack is one ``msgpack``-packed row
+    dict (``input_ids`` / ``labels`` / ``image_embeds`` bf16 blobs / ``embed_n_tok``
+    / ``embed_dim`` / …). This is the first op in the ArrayRecord grain pipeline;
+    its output rows are grouped by ``grain.Batch(batch_fn=<collator>)`` downstream.
+    ``msgpack`` is imported lazily so importing this module never requires it.
+    """
+
+    def __post_init__(self):
+        import msgpack  # lazy: array_record/msgpack are optional, Linux-only deps
+
+        self._unpackb = msgpack.unpackb
+
+    def map(self, record: bytes):
+        return self._unpackb(record, raw=False)
+
+
 def shift_and_pad(mask, *tensors):
     """Shift tensors to align with the first non-zero mask position.
 

@@ -871,6 +871,31 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to use grain instead of `tensorflow-datasets`."},
     )
+    arrayrecord_train_files: str | list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Path / glob / list of ``.array_record`` files for the VL pack. When set, the "
+            "trainer builds a grain ArrayRecord dataloader (true global IndexSampler shuffle + "
+            "per-host sharding + random access) and uses ``data_collator`` as the per-batch "
+            "``grain.Batch`` ``batch_fn`` — bypassing the sequential ShardedDataSource path."
+        },
+    )
+    arrayrecord_eval_files: str | list[str] | None = field(
+        default=None,
+        metadata={"help": "Optional ``.array_record`` files for evaluation (same pipeline as train)."},
+    )
+    arrayrecord_num_threads: int = field(
+        default=16,
+        metadata={"help": "grain ReadOptions.num_threads for ArrayRecord reads (parallel prefetch)."},
+    )
+    arrayrecord_prefetch_buffer: int = field(
+        default=64,
+        metadata={"help": "grain ReadOptions.prefetch_buffer_size for the ArrayRecord dataloader."},
+    )
+    arrayrecord_worker_count: int = field(
+        default=0,
+        metadata={"help": "grain DataLoader worker_count (0 = read in-process with num_threads)."},
+    )
     use_wandb: bool = field(
         default=True,
         metadata={"help": "Whether to use Weights & Biases for logging."},

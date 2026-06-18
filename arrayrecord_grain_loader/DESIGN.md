@@ -209,3 +209,28 @@ dl   = grain.python.DataLoader(data_source=src, sampler=samp,
 ```
 `grain.python.Batch` accepts `batch_fn`, so VL packing (many-rows→one-batch) fits without
 a bespoke stage — unlike the existing per-row grain path (`base_trainer.py:5034-5044`).
+
+## Production wiring (committed: bbe0064b)
+
+Wired into the trainer so the VL pack can run through grain ArrayRecord by config alone:
+
+- `training_configurations.py`: new fields — `arrayrecord_train_files` / `arrayrecord_eval_files`
+  (path / glob / list), `arrayrecord_num_threads` (16), `arrayrecord_prefetch_buffer` (64),
+  `arrayrecord_worker_count` (0). Shuffle/seed/epochs/sharding reuse existing fields
+  (`shuffle_train_dataset`, `shuffle_seed_train`, `num_train_epochs`, `grain_shard_index/count`).
+- `trainers/utils.py`: `MsgpackDecode(pygrain.MapTransform)` — record bytes → row dict (lazy msgpack).
+- `base_trainer.py`: `configure_dataloaders()` dispatches to new `_configure_arrayrecord_dataloader()`
+  when `arrayrecord_train_files` is set (checked before use_grain/tfds). It builds
+  `ArrayRecordDataSource(expand(files))` → `IndexSampler(shuffle, ShardOptions(proc_idx, proc_count))`
+  → `DataLoader(ops=[MsgpackDecode(), Batch(B, drop_remainder=True, batch_fn=self.data_collator)],
+  ReadOptions(num_threads, prefetch_buffer_size))`. `data_collator` (the VL packed-embeds collator,
+  e.g. EmbedsWindowPacker→collate_packed_embeds) is the per-batch `batch_fn`, so the loader yields
+  collated dicts; the loop's `_apply_user_data_collator` no-ops on a dict (no double collation),
+  then `_purify_batch` strips non-array fields. Per-host step count = `(len//shard_count//B)*epochs`.
+- `pyproject.toml`: `array_record; platform_system=='Linux'` + `msgpack>=1.0.0`.
+
+Usage: set `data_collator=<VL collator>` + `arrayrecord_train_files=[gs://…*.array_record]`; no other
+change. Validation: syntax (py_compile) + glue verified vs real signatures + the core pipeline is the
+benchmark above. Remaining: full distillation trainer smoke on v4-128 to read the trainer's own
+data_collection_time (confirmatory; the benchmark already establishes data-wait≈0). Resume/seek
+(grain checkpointing) and full-vlm_v2 conversion are the next iteration.

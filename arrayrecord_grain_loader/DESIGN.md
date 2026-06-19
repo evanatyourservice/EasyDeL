@@ -258,3 +258,46 @@ decode+batch: .map(MsgpackDecode()).batch(B, drop_remainder=True, batch_fn=data_
 drive:        .to_iter_dataset(ReadOptions(num_threads, prefetch_buffer_size))
 ```
 **Conversion layout consequence:** the full vlm_v2 conversion writes **one ArrayRecord set per dataset** (per `source=`), NOT one concatenated set — so weights stay controllable. `mix` length is bounded by the most-constrained `size_i/w_i`; `repeat` cycles. group_size=1, msgpack rows, bf16 blobs verbatim (as in the sample convert).
+
+## Corners cut / proven-vs-assumed (honest accounting)
+
+PROVEN (empirical):
+- Byte-exact convert/round-trip (incl multi-image), weighted-mix controllability, multi-span
+  scatter, the full convert→read→collate pipeline, the uncollated-list collation contract —
+  all as REPO TESTS (see below) + on real gs:// sample data.
+- gs:// native ArrayRecord reads; data-wait≈0 in the real trainer (data_collection_time 0.608s
+  vs 607s step); a real KD step with sane loss through the wired path.
+
+ASSUMED / DEFERRED / SIMPLIFIED:
+- SCALE: all proofs + smokes use a 4-file SAMPLE (≈410 rows; one parquet part per source) +
+  one multi-image part. The full ~1.4M-row vlm_v2 conversion is NOT done (Evan-gated next).
+- THROUGHPUT is single-host: ~195 MB/s / 24–102× headroom measured on the head CPU VM only.
+  No production multi-host (16-host) aggregate-throughput test, and not on a TPU-pod host
+  (likely faster net). worker_count=0 (in-process threads); multiprocess prefetch not measured.
+  Expectation: per-host headroom holds (each host reads only its shard); not empirically at scale.
+- MFU/packing density: per-batch EmbedsWindowPacker, NOT tuned or measured (Evan: secondary).
+- RESUME/SEEK: grain IterDataset is checkpointable, but no explicit checkpoint/resume hook is
+  wired — `_ReiterableDataLoader` restarts fresh per iter (no mid-epoch seek). Needed for the
+  full run's resume-from-step; deferred.
+- EVAL path (`arrayrecord_eval_datasets`) is wired but only the TRAIN path was smoke-tested.
+- MIX EPOCH LENGTH = min_i(size_i / weight_i): a dataset whose weight is large relative to its
+  size becomes the binding constraint (epoch ends when it would exhaust). Full-run weights must
+  account for this (or rely on `.repeat`). Not validated at full scale.
+- NaN-grad after step 1 on the bare seq2048/lr1e-4 config: shown to be path-independent
+  (config/numerics, not the loader) via the control test; the NaN itself is NOT root-caused
+  (training-stability, Evan's domain — production uses the klfix2-stabilized image/config).
+
+## Repo test coverage (libs/easydel/tests/data/test_arrayrecord_grain.py — 5 passing)
+
+| Test | Covers |
+|------|--------|
+| test_batch_byte_exact_arrayrecord_vs_parquet | (i) collated batch identical arrayrecord vs parquet |
+| test_weighted_mix_proportions_controllable   | (ii) grain mix samples by weights, not sizes |
+| test_multi_image_scatter                      | (iii) n_images≥2 round-trip + multi-span scatter |
+| test_convert_read_collate_pipeline            | (iv) parquet→.array_record→source→decode→collate |
+| test_loader_yields_uncollated_lists           | (v) batch_fn=list contract (double-collation regression) |
+
+Self-contained: synthetic fixtures (tiny dims), `importorskip` for array_record/grain/msgpack/
+ml_dtypes — runs in CI with no GCS/TPU/staged data. NOT unit-tested (smoke/ad-hoc only): the
+in-trainer 27B KD step (smoke), gs:// reads (needs creds), multi-host shard disjointness
+(ad-hoc in mapdataset_pipeline.py).

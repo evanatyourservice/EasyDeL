@@ -589,6 +589,182 @@ class MixedShardedSource(ShardedDataSource[dict]):
         )
 
 
+class BatchHomogeneousMixedShardedSource(ShardedDataSource[dict]):
+    """:class:`ShardedDataSource` adapter that emits whole language or vision batches.
+
+    ``MixedShardedSource`` interleaves at row granularity. This source chooses a modality group once
+    per emitted batch, then draws every row in that batch from that group so downstream collation never
+    builds a mixed language+vision batch.
+    """
+
+    def __init__(
+        self,
+        sources: dict[str, ShardedDataSource],
+        vision_sources: "Sequence[str]",
+        weights: dict[str, float] | None = None,
+        batch_size: int = 1,
+        vision_batch_interval: int = 20,
+        seed: int | None = None,
+        stop_strategy: str = "restart",
+    ):
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if vision_batch_interval <= 0:
+            raise ValueError(f"vision_batch_interval must be >= 1, got {vision_batch_interval}")
+
+        self._sources = sources
+        self._names = list(sources.keys())
+        vision_set = set(vision_sources)
+        missing = vision_set - set(self._names)
+        if missing:
+            raise ValueError(f"vision source names are not present in sources: {sorted(missing)}")
+        self._vision_names = [name for name in self._names if name in vision_set]
+        self._language_names = [name for name in self._names if name not in vision_set]
+        self._batch_size = int(batch_size)
+        self._vision_batch_interval = int(vision_batch_interval)
+        self._seed = seed
+        self._stop_strategy = stop_strategy
+
+        if weights is None:
+            n = len(self._names)
+            self._weights = {name: 1.0 / n for name in self._names}
+        else:
+            missing_weights = set(self._names) - set(weights.keys())
+            if missing_weights:
+                raise ValueError(f"Weight keys must match source names. Missing: {sorted(missing_weights)}")
+            extra = set(weights.keys()) - set(self._names)
+            if extra:
+                raise ValueError(f"Weight keys must match source names. Extra: {sorted(extra)}")
+            total = float(sum(weights[name] for name in self._names))
+            if total <= 0:
+                raise ValueError("Sum of mixture weights must be > 0.")
+            self._weights = {name: float(weights[name]) / total for name in self._names}
+
+    @property
+    def shard_names(self) -> "Sequence[str]":
+        """Return a single synthetic shard name for the virtual mix."""
+        return ["homogeneous_mixed_shard_0"]
+
+    def num_shards(self) -> int:
+        """Return the constant shard count of one."""
+        return 1
+
+    @property
+    def batch_size(self) -> int:
+        """Rows per homogeneous batch."""
+        return self._batch_size
+
+    @property
+    def vision_batch_interval(self) -> int:
+        """Every Nth batch is drawn from vision sources when both groups exist."""
+        return self._vision_batch_interval
+
+    def with_batch_size(self, batch_size: int) -> "BatchHomogeneousMixedShardedSource":
+        """Return an equivalent source using the trainer's actual row batch size."""
+        return type(self)(
+            sources=self._sources,
+            vision_sources=self._vision_names,
+            weights=self._weights,
+            batch_size=batch_size,
+            vision_batch_interval=self._vision_batch_interval,
+            seed=self._seed,
+            stop_strategy=self._stop_strategy,
+        )
+
+    def _group_names_for_batch(self, batch_idx: int) -> list[str]:
+        """Return the modality group selected for ``batch_idx``."""
+        if self._vision_names and self._language_names and batch_idx % self._vision_batch_interval == 0:
+            return self._vision_names
+        if self._language_names:
+            return self._language_names
+        if self._vision_names:
+            return self._vision_names
+        return self._names
+
+    def _compute_group_counts(self, names: list[str]) -> dict[str, int]:
+        """Resolve per-source row counts inside one homogeneous batch."""
+        ws = np.array([self._weights.get(name, 0.0) for name in names], dtype=np.float64)
+        total = ws.sum()
+        ws = ws / total if total > 0 else np.ones(len(names), dtype=np.float64) / len(names)
+        raw = ws * self._batch_size
+        counts_arr = np.floor(raw).astype(int)
+        remainder = self._batch_size - counts_arr.sum()
+        if remainder > 0:
+            order = np.argsort(-(raw - counts_arr))
+            for idx in order[:remainder]:
+                counts_arr[idx] += 1
+        return {name: int(counts_arr[i]) for i, name in enumerate(names)}
+
+    def _batch_source_ids(self, batch_idx: int) -> list[str]:
+        """Build the deterministic source order for one homogeneous batch."""
+        counts = self._compute_group_counts(self._group_names_for_batch(batch_idx))
+        ids = []
+        for name, count in counts.items():
+            ids.extend([name] * count)
+        rng = np.random.default_rng(self._seed + batch_idx if self._seed is not None else None)
+        rng.shuffle(ids)
+        return ids
+
+    def open_shard(self, _shard_name: str) -> "Iterator[dict]":
+        """Yield rows in homogeneous batch-sized runs."""
+        iters = {name: self._chain_shards(source) for name, source in self._sources.items()}
+        batch_idx = 0
+
+        while True:
+            ids = self._batch_source_ids(batch_idx)
+            exhausted = set()
+            for name in ids:
+                try:
+                    example = next(iters[name])
+                except StopIteration:
+                    if self._stop_strategy == "restart":
+                        iters[name] = self._chain_shards(self._sources[name])
+                        try:
+                            example = next(iters[name])
+                        except StopIteration:
+                            logger.warning(f"Dataset '{name}' is empty")
+                            exhausted.add(name)
+                            continue
+                    elif self._stop_strategy == "first_exhausted":
+                        return
+                    else:
+                        exhausted.add(name)
+                        continue
+                example["__source__"] = name
+                yield example
+
+            if exhausted and exhausted == set(ids):
+                return
+            batch_idx += 1
+
+    def open_shard_at_row(self, _shard_name: str, row: int) -> "Iterator[dict]":
+        """Open the synthetic shard after ``row`` emitted examples."""
+        row = max(int(row), 0)
+        if row:
+            logger.warning(
+                "Seeked resume for BatchHomogeneousMixedShardedSource falls back to sequential skip of %d rows.",
+                row,
+            )
+        yield from itertools.islice(self.open_shard(_shard_name), row, None)
+
+    def _chain_shards(self, source: ShardedDataSource) -> "Iterator[dict]":
+        """Chain every shard of ``source`` into one continuous iterator."""
+        for shard_name in source.shard_names:
+            yield from source.open_shard(shard_name)
+
+    def __len__(self) -> int:
+        """Return the notional one-pass row count."""
+        return sum(len(source) for source in self._sources.values())
+
+    def __repr__(self) -> str:
+        """Return a developer-friendly representation."""
+        return (
+            "BatchHomogeneousMixedShardedSource("
+            f"sources={len(self._sources)}, vision_sources={self._vision_names}, "
+            f"batch_size={self._batch_size}, vision_batch_interval={self._vision_batch_interval})"
+        )
+
+
 class MixStage(BaseStage):
     """Pipeline stage that collapses ``{name: source}`` into a single mixed source.
 
@@ -667,14 +843,25 @@ class MixStage(BaseStage):
             )
 
         # Create mixed source
-        mixed = MixedShardedSource(
-            sources=data,
-            weights=self._stage_config.weights,
-            block_size=self._stage_config.block_size,
-            seed=self._stage_config.seed or context.seed,
-            stop_strategy=self._stage_config.stop_strategy,
-            weight_scheduler=weight_scheduler,
-        )
+        if self._stage_config.vision_batch_interval is not None and self._stage_config.vision_sources:
+            mixed = BatchHomogeneousMixedShardedSource(
+                sources=data,
+                vision_sources=self._stage_config.vision_sources,
+                weights=self._stage_config.weights,
+                batch_size=self._stage_config.batch_size or 1,
+                vision_batch_interval=self._stage_config.vision_batch_interval,
+                seed=self._stage_config.seed or context.seed,
+                stop_strategy=self._stage_config.stop_strategy,
+            )
+        else:
+            mixed = MixedShardedSource(
+                sources=data,
+                weights=self._stage_config.weights,
+                block_size=self._stage_config.block_size,
+                seed=self._stage_config.seed or context.seed,
+                stop_strategy=self._stage_config.stop_strategy,
+                weight_scheduler=weight_scheduler,
+            )
 
         logger.info(f"Mixed {len(data)} datasets with block_size={self._stage_config.block_size}")
         return {"mixed": mixed}
@@ -686,6 +873,9 @@ def block_mixture_interleave(
     block_size: int = 1000,
     seed: int | None = 42,
     stop: str = "restart",
+    batch_size: int | None = None,
+    vision_indices: "Sequence[int] | None" = None,
+    vision_batch_interval: int | None = None,
 ):
     """Create a deterministic block-based mixture of multiple datasets.
 
@@ -726,29 +916,93 @@ def block_mixture_interleave(
     """
     from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
-    if not isinstance(datasets, dict):
-        raise TypeError(f"datasets must be a dict, got {type(datasets).__name__}")
-
-    dataset_names = list(datasets.keys())
-    datasets_list = list(datasets.values())
+    if isinstance(datasets, dict):
+        dataset_names = list(datasets.keys())
+        datasets_list = list(datasets.values())
+    elif isinstance(datasets, (list, tuple)):
+        dataset_names = [str(i) for i in range(len(datasets))]
+        datasets_list = list(datasets)
+    else:
+        raise TypeError(f"datasets must be a dict/list/tuple, got {type(datasets).__name__}")
     n = len(datasets_list)
 
     if n == 0:
         raise ValueError("No datasets to mix")
 
     if weights is not None:
-        if not isinstance(weights, dict):
-            raise TypeError(f"weights must be a dict or None, got {type(weights).__name__}")
-        missing = set(dataset_names) - set(weights.keys())
-        if missing:
-            raise ValueError(f"Weight keys must match dataset keys. Missing: {missing}")
-        extra = set(weights.keys()) - set(dataset_names)
-        if extra:
-            raise ValueError(f"Weight keys must match dataset keys. Extra: {extra}")
-        ws = np.array([weights[name] for name in dataset_names], dtype=np.float64)
+        if isinstance(weights, dict):
+            missing = set(dataset_names) - set(weights.keys())
+            if missing:
+                raise ValueError(f"Weight keys must match dataset keys. Missing: {missing}")
+            extra = set(weights.keys()) - set(dataset_names)
+            if extra:
+                raise ValueError(f"Weight keys must match dataset keys. Extra: {extra}")
+            ws = np.array([weights[name] for name in dataset_names], dtype=np.float64)
+        elif isinstance(weights, (list, tuple)):
+            if len(weights) != n:
+                raise ValueError(f"weights length must match datasets length ({n}), got {len(weights)}")
+            ws = np.array(weights, dtype=np.float64)
+        else:
+            raise TypeError(f"weights must be a dict/list/tuple or None, got {type(weights).__name__}")
         ws = ws / ws.sum()
     else:
         ws = np.ones(n, dtype=np.float64) / n
+
+    if batch_size is not None and vision_indices is not None and vision_batch_interval is not None:
+        batch_size = int(batch_size)
+        vision_batch_interval = int(vision_batch_interval)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if vision_batch_interval <= 0:
+            raise ValueError(f"vision_batch_interval must be >= 1, got {vision_batch_interval}")
+        vision_set = {int(i) for i in vision_indices}
+        if any(i < 0 or i >= n for i in vision_set):
+            raise ValueError(f"vision_indices must be in [0, {n}), got {sorted(vision_set)}")
+        vision_indices_list = [i for i in range(n) if i in vision_set]
+        language_indices = [i for i in range(n) if i not in vision_set]
+
+        def group_ids(indices: list[int]) -> list[int]:
+            group_ws = ws[indices]
+            total = group_ws.sum()
+            group_ws = group_ws / total if total > 0 else np.ones(len(indices), dtype=np.float64) / len(indices)
+            raw = group_ws * batch_size
+            group_counts = np.floor(raw).astype(int)
+            remainder = batch_size - int(group_counts.sum())
+            if remainder > 0:
+                order = np.argsort(-(raw - group_counts))
+                for idx in order[:remainder]:
+                    group_counts[idx] += 1
+            ids = []
+            for idx, count in zip(indices, group_counts, strict=True):
+                ids.extend([idx] * int(count))
+            return ids
+
+        def gen_homogeneous():
+            """Inline closure for batch-homogeneous language/vision mixing."""
+            iters = [iter(ds) for ds in datasets_list]
+            batch_idx = 0
+            while True:
+                if vision_indices_list and language_indices and batch_idx % vision_batch_interval == 0:
+                    ids = group_ids(vision_indices_list)
+                else:
+                    ids = group_ids(language_indices or vision_indices_list or list(range(n)))
+                rng = np.random.default_rng(seed + batch_idx if seed is not None else None)
+                rng.shuffle(ids)
+                for i in ids:
+                    try:
+                        yield next(iters[i])
+                    except StopIteration:
+                        if stop == "restart":
+                            iters[i] = iter(datasets_list[i])
+                            try:
+                                yield next(iters[i])
+                            except StopIteration as e:
+                                raise ValueError(f"Dataset at index {i} is empty and cannot be restarted") from e
+                        else:
+                            return
+                batch_idx += 1
+
+        return IterableDataset.from_generator(gen_homogeneous)
 
     counts = np.floor(ws * block_size).astype(int)
     remainder = block_size - counts.sum()

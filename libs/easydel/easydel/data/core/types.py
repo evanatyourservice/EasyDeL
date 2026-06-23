@@ -373,6 +373,9 @@ class DatasetMixture:
             keyed by dataset identifier (the constituent's
             ``data_files`` path or explicit name). ``None`` falls back
             to uniform mixing.
+        vision_batch_interval (int | None): When set for a mixed text/VL
+            streaming mixture, every Nth emitted batch is drawn wholly
+            from visual informs and other batches from text informs.
 
     Example:
         >>> from easydel.data import DatasetMixture, TextDatasetInform
@@ -433,6 +436,7 @@ class DatasetMixture:
     stop_strategy: str = "restart"
 
     mixture_weights: dict[str, float] | None = None
+    vision_batch_interval: int | None = None
 
     def __post_init__(self):
         """Normalise :attr:`cache_dir` to an :class:`ePath` and ensure it exists.

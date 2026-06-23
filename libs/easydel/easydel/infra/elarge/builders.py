@@ -952,6 +952,8 @@ def to_data_mixture_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str,
         kwargs["stop_strategy"] = mixture_cfg["stop_strategy"]
     if "mixture_weights" in mixture_cfg:
         kwargs["mixture_weights"] = mixture_cfg["mixture_weights"]
+    if "vision_batch_interval" in mixture_cfg:
+        kwargs["vision_batch_interval"] = mixture_cfg["vision_batch_interval"]
 
     return kwargs
 
@@ -1565,6 +1567,47 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     return f"dataset_{fallback_index}"
 
 
+def _is_visual_inform_config(inform_cfg: Mapping[str, Any]) -> bool:
+    """Return whether an ELM inform should be treated as a vision source."""
+    if "pixel_field" in inform_cfg:
+        return True
+    for flag in ("is_vision", "vision", "visual"):
+        if flag in inform_cfg:
+            return bool(inform_cfg[flag])
+    modality = str(inform_cfg.get("modality", "")).lower()
+    return modality in {"vision", "visual", "vl", "vlm", "image", "image-text", "image_text"}
+
+
+def _configured_vision_source_names(mixture_cfg: Mapping[str, Any]) -> set[str]:
+    """Read optional explicit vision source names from mixture config aliases."""
+    names = (
+        mixture_cfg.get("vision_source_names")
+        or mixture_cfg.get("vision_sources")
+        or mixture_cfg.get("visual_source_names")
+        or mixture_cfg.get("visual_sources")
+        or []
+    )
+    if isinstance(names, str):
+        return {names}
+    return {str(name) for name in names}
+
+
+def _coerce_mixture_weights(
+    weights: Any,
+    names: list[str],
+) -> dict[str, float] | None:
+    """Normalize list- or dict-style mixture weights to source-name keys."""
+    if weights is None:
+        return None
+    if isinstance(weights, Mapping):
+        return {str(name): float(weight) for name, weight in weights.items()}
+    if isinstance(weights, (list, tuple)):
+        if len(weights) != len(names):
+            raise ValueError(f"mixture_weights length must match informs length ({len(names)}), got {len(weights)}")
+        return {name: float(weights[i]) for i, name in enumerate(names)}
+    raise TypeError(f"mixture_weights must be a mapping, list, tuple, or None; got {type(weights).__name__}")
+
+
 def _create_source_from_inform(
     inform_cfg: Mapping[str, Any],
     mixture_cfg: Mapping[str, Any],
@@ -1825,6 +1868,7 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
         _create_source_from_inform: For individual source creation.
     """
     from easydel.data.transforms import (
+        BatchHomogeneousMixedShardedSource,
         MapTransform,
         MixedShardedSource,
         RenameFields,
@@ -1839,6 +1883,8 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
 
     # Build ShardedDataSource for each inform
     sources: dict[str, "ShardedDataSource"] = {}
+    vision_source_names: list[str] = []
+    configured_vision_sources = _configured_vision_source_names(mixture_cfg)
     content_target = mixture_cfg.get("text_target_field", "text")
 
     for i, inform_cfg in enumerate(mixture_cfg.get("informs", [])):
@@ -1871,18 +1917,31 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
             source = source.transform(RenameFields({content_field: content_target}))
 
         sources[name] = source
+        if name in configured_vision_sources or _is_visual_inform_config(inform_cfg):
+            vision_source_names.append(name)
 
     # Mix if multiple sources
     if len(sources) > 1:
-        weights = mixture_cfg.get("mixture_weights")
-
-        source = MixedShardedSource(
-            sources=sources,
-            weights=weights,
-            block_size=mixture_cfg.get("mixture_block_size", 2048),
-            seed=mixture_cfg.get("seed", 42),
-            stop_strategy=mixture_cfg.get("stop_strategy", "restart"),
-        )
+        weights = _coerce_mixture_weights(mixture_cfg.get("mixture_weights"), list(sources.keys()))
+        vision_batch_interval = mixture_cfg.get("vision_batch_interval")
+        if vision_batch_interval is not None and vision_source_names and len(vision_source_names) < len(sources):
+            source = BatchHomogeneousMixedShardedSource(
+                sources=sources,
+                vision_sources=vision_source_names,
+                weights=weights,
+                batch_size=mixture_cfg.get("batch_size", 1),
+                vision_batch_interval=int(vision_batch_interval),
+                seed=mixture_cfg.get("seed", 42),
+                stop_strategy=mixture_cfg.get("stop_strategy", "restart"),
+            )
+        else:
+            source = MixedShardedSource(
+                sources=sources,
+                weights=weights,
+                block_size=mixture_cfg.get("mixture_block_size", 2048),
+                seed=mixture_cfg.get("seed", 42),
+                stop_strategy=mixture_cfg.get("stop_strategy", "restart"),
+            )
     else:
         source = next(iter(sources.values()))
 
@@ -1894,7 +1953,11 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
     # it; set it to 0/None to disable, or raise it (e.g. several x `mixture_block_size`)
     # for a stronger shuffle at higher host-memory cost.
     shuffle_buffer_size = mixture_cfg.get("shuffle_buffer_size")
-    if shuffle_buffer_size:
+    if shuffle_buffer_size and isinstance(source, BatchHomogeneousMixedShardedSource):
+        logger.info(
+            "Skipping mixture.shuffle_buffer_size because vision_batch_interval requires batch-homogeneous ordering."
+        )
+    elif shuffle_buffer_size:
         source = source.shuffle(
             buffer_size=int(shuffle_buffer_size),
             seed=mixture_cfg.get("seed", 42),

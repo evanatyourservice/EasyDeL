@@ -37,12 +37,16 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
 import numpy as np
 import spectrax as spx
 from eformer.loggings import get_logger
+from jax._src.stages import Compiled
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.sharding import replicated_named_sharding
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
@@ -357,25 +361,33 @@ class DistillationTrainer(Trainer):
         )
 
         static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25)
+
+        def compile_distillation_step(*, is_train: bool):
+            """Build one distillation step wrapper for one batch pytree specialization."""
+            if self.arguments.mpmd_scheduler is None:
+                kwargs = {
+                    "in_shardings": (self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                    "out_shardings": (self.state_shardings, empty_sharding) if is_train else empty_sharding,
+                    "static_argnums": static_argnums,
+                }
+                if is_train:
+                    kwargs["donate_argnums"] = (0,)
+                return spx.jit(distillation_step, **kwargs)
+            kwargs = {
+                "in_shardings": (self.state_shardings, empty_sharding, self.teacher_state.shardings),
+                "out_shardings": (self.state_shardings, empty_sharding) if is_train else empty_sharding,
+                "static_argnums": static_argnums,
+                "mesh": self.model.mesh,
+                "schedule": self.arguments.mpmd_scheduler,
+            }
+            if is_train:
+                kwargs["donate_argnums"] = (0,)
+            return compile_trainer_step(distillation_step, **kwargs)
+
         self._runtime_trace("train.compile_wrapper.begin")
-        if self.arguments.mpmd_scheduler is None:
-            sharded_training_step_function = spx.jit(
-                distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
-                out_shardings=(self.state_shardings, empty_sharding),
-                donate_argnums=(0,),
-                static_argnums=static_argnums,
-            )
-        else:
-            sharded_training_step_function = compile_trainer_step(
-                distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
-                out_shardings=(self.state_shardings, empty_sharding),
-                donate_argnums=(0,),
-                static_argnums=static_argnums,
-                mesh=self.model.mesh,
-                schedule=self.arguments.mpmd_scheduler,
-            )
+        sharded_training_step_function_language = compile_distillation_step(is_train=True)
+        sharded_training_step_function_vision = compile_distillation_step(is_train=True)
+        sharded_training_step_function = sharded_training_step_function_vision
         self._runtime_trace("train.compile_wrapper.end")
 
         self._eval_shared_fn_static_args = (
@@ -405,26 +417,21 @@ class DistillationTrainer(Trainer):
         )
 
         self._runtime_trace("eval.compile_wrapper.begin")
-        if self.arguments.mpmd_scheduler is None:
-            sharded_evaluation_step_function = spx.jit(
-                distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
-                out_shardings=empty_sharding,
-                static_argnums=static_argnums,
-            )
-        else:
-            sharded_evaluation_step_function = compile_trainer_step(
-                distillation_step,
-                in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
-                out_shardings=empty_sharding,
-                static_argnums=static_argnums,
-                mesh=self.model.mesh,
-                schedule=self.arguments.mpmd_scheduler,
-            )
+        sharded_evaluation_step_function_language = compile_distillation_step(is_train=False)
+        sharded_evaluation_step_function_vision = compile_distillation_step(is_train=False)
+        sharded_evaluation_step_function = sharded_evaluation_step_function_vision
         self._runtime_trace("eval.compile_wrapper.end")
 
+        sharded_training_step_function_language.static_argnums_ = static_argnums
+        sharded_training_step_function_vision.static_argnums_ = static_argnums
+        sharded_evaluation_step_function_language.static_argnums_ = static_argnums
+        sharded_evaluation_step_function_vision.static_argnums_ = static_argnums
         sharded_training_step_function.static_argnums_ = static_argnums
         sharded_evaluation_step_function.static_argnums_ = static_argnums
+        self.sharded_training_step_function_language = sharded_training_step_function_language
+        self.sharded_training_step_function_vision = sharded_training_step_function_vision
+        self.sharded_evaluation_step_function_language = sharded_evaluation_step_function_language
+        self.sharded_evaluation_step_function_vision = sharded_evaluation_step_function_vision
 
         # Teacher is frozen: it contributes a forward pass only, no backward.
         teacher_forward_flops = self.teacher_state.model.flops_per_token(
@@ -575,7 +582,252 @@ class DistillationTrainer(Trainer):
                     completion_mask_np = completion_mask_np * np.asarray(attention_mask)
                 batch["completion_mask"] = completion_mask_np
 
+        self._strip_empty_vision_sidechannels(batch)
         return batch, infos
+
+    @staticmethod
+    def _value_has_rows(value: tp.Any) -> bool:
+        """Return whether a batch leaf carries at least one leading-row item."""
+        if value is None:
+            return False
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            return len(shape) == 0 or int(shape[0]) > 0
+        if isinstance(value, (list, tuple, dict)):
+            return len(value) > 0
+        return True
+
+    @staticmethod
+    def _strip_empty_vision_sidechannels(batch: dict[str, tp.Any]) -> None:
+        """Drop empty multimodal leaves so text batches take the language-only JIT."""
+        image_embeds = batch.get("image_embeds")
+        shape = getattr(image_embeds, "shape", None)
+        if image_embeds is None or shape is None or len(shape) == 0 or int(shape[0]) != 0:
+            return
+        for key in (
+            "image_embeds",
+            "image_embed_positions",
+            "image_embed_mask",
+            "image_grid_thw",
+            "n_real_embeds",
+        ):
+            batch.pop(key, None)
+
+    @classmethod
+    def _batch_has_vision(cls, batch: dict[str, tp.Any]) -> bool:
+        """Host-side predicate used to select the vision or language compiled step."""
+        for key in (
+            "image_embeds",
+            "video_embeds",
+            "visual_embeds",
+            "pixel_values",
+            "pixel_values_videos",
+            "image_features",
+            "video_features",
+            "image_hidden_states",
+            "video_hidden_states",
+        ):
+            if key in batch and cls._value_has_rows(batch.get(key)):
+                return True
+        return False
+
+    def _select_distillation_step_function(self, batch: dict[str, tp.Any], *, is_train: bool):
+        """Return the language or vision callable for ``batch``."""
+        suffix = "vision" if self._batch_has_vision(batch) else "language"
+        attr = f"sharded_{'training' if is_train else 'evaluation'}_step_function_{suffix}"
+        return getattr(
+            self,
+            attr,
+            self.sharded_training_step_function if is_train else self.sharded_evaluation_step_function,
+        )
+
+    def _execute_eval_step(self, state, batch) -> LossMetrics:
+        """Run one distillation evaluation step with language/vision dispatch."""
+        batch, informations = self._preprocess_batch_input(
+            state=state,
+            batch=batch,
+            is_train=False,
+        )
+        step_function = self._select_distillation_step_function(batch, is_train=False)
+        metrics = step_function(
+            state,
+            batch,
+            *self._eval_shared_fn_extra_args,
+            *self._eval_shared_fn_static_args,
+        )
+        if len(informations) != 0:
+            if metrics.other_metrics is not None:
+                informations.update(metrics.other_metrics)
+            metrics = metrics.replace(other_metrics=informations)
+        return metrics
+
+    def _execute_train_step(
+        self,
+        state,
+        batch,
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
+        """Run one distillation training step with language/vision dispatch."""
+        if self.pruning_module is not None:
+            state = state.replace(
+                graphstate=self.pruning_module.pre_forward_update(
+                    state.graphstate,
+                    state.opt_state,
+                )
+            )
+        metrics = LossMetrics()
+        try:
+            self._runtime_trace("execute_train_step.preprocess.begin", batch=self._runtime_batch_summary(batch))
+            batch, informations = self._preprocess_batch_input(
+                state=state,
+                batch=batch,
+                is_train=True,
+            )
+            batch_has_vision = self._batch_has_vision(batch)
+            self._runtime_trace(
+                "execute_train_step.preprocess.end",
+                batch=self._runtime_batch_summary(batch),
+                information_keys=tuple(informations.keys()) if isinstance(informations, dict) else None,
+                batch_has_vision=batch_has_vision,
+            )
+
+            self._runtime_trace("execute_train_step.compiled_call.begin", batch_has_vision=batch_has_vision)
+            step_function = self._select_distillation_step_function(batch, is_train=True)
+            state, metrics = jax.block_until_ready(
+                step_function(
+                    state,
+                    batch,
+                    *self._train_shared_fn_extra_args,
+                    *self._train_shared_fn_static_args,
+                )
+            )
+            self._runtime_trace(
+                "execute_train_step.compiled_call.end",
+                step=int(jax.device_get(state.step)),
+                metrics_type=type(metrics).__name__,
+                batch_has_vision=batch_has_vision,
+            )
+
+            if len(informations) != 0:
+                if metrics.other_metrics is not None:
+                    informations.update(metrics.other_metrics)
+                metrics = metrics.replace(other_metrics=informations)
+
+            if self.pruning_module is not None:
+                state = state.replace(
+                    graphstate=self.pruning_module.post_gradient_update(
+                        state.graphstate,
+                        state.opt_state,
+                    )
+                )
+            return state, metrics, None
+        except (
+            KeyboardInterrupt,
+            EasyDeLTimerError,
+            EasyDeLBreakRequest,
+            TypeError,
+        ) as run_exception:
+            self._runtime_trace(
+                "execute_train_step.control_exception",
+                exc_type=type(run_exception).__name__,
+                exc=str(run_exception),
+            )
+            return state, metrics, run_exception
+        except Exception as run_exception:
+            self._runtime_trace(
+                "execute_train_step.exception",
+                exc_type=type(run_exception).__name__,
+                exc=str(run_exception),
+            )
+            if self._is_memory_oom_exception(run_exception):
+                annotated_exception = self._augment_memory_oom_exception(run_exception)
+                logger.error(str(annotated_exception))
+                return state, metrics, annotated_exception
+            raise
+
+    def compile_aot(self) -> bool:
+        """AOT-compile observed language and vision distillation batch pytrees."""
+
+        def identity(x):
+            return x
+
+        def preprocessed_batches(dataloader, *, is_train: bool, max_batches: int = 64):
+            data_collator = self.data_collator or identity
+            for idx, raw_batch in enumerate(iter(dataloader)):
+                if idx >= max_batches:
+                    break
+                batch = data_collator(raw_batch)
+                batch, _ = self._preprocess_batch_input(
+                    state=self.model_state,
+                    batch=batch,
+                    is_train=is_train,
+                )
+                yield batch
+
+        def compile_function(function, batch, state, tag, extra_args, static_args):
+            if isinstance(function, Compiled):
+                return function
+            logger.info("Compiling function: %s", tag)
+            return function.lower(state, batch, *extra_args, *static_args).compile()
+
+        compiled = False
+
+        if self.dataloader_train is not None:
+            train_batches: dict[bool, dict[str, tp.Any]] = {}
+            for batch in preprocessed_batches(self.dataloader_train, is_train=True):
+                train_batches.setdefault(self._batch_has_vision(batch), batch)
+                if len(train_batches) == 2:
+                    break
+            if False in train_batches:
+                self.sharded_training_step_function_language = compile_function(
+                    self.sharded_training_step_function_language,
+                    train_batches[False],
+                    self.model_state,
+                    "trainer.sharded_training_step_function_language",
+                    self._train_shared_fn_extra_args,
+                    self._train_shared_fn_static_args,
+                )
+                compiled = True
+            if True in train_batches:
+                self.sharded_training_step_function_vision = compile_function(
+                    self.sharded_training_step_function_vision,
+                    train_batches[True],
+                    self.model_state,
+                    "trainer.sharded_training_step_function_vision",
+                    self._train_shared_fn_extra_args,
+                    self._train_shared_fn_static_args,
+                )
+                compiled = True
+            self.sharded_training_step_function = self.sharded_training_step_function_vision
+
+        if self.dataloader_eval is not None:
+            eval_batches: dict[bool, dict[str, tp.Any]] = {}
+            for batch in preprocessed_batches(self.dataloader_eval, is_train=False):
+                eval_batches.setdefault(self._batch_has_vision(batch), batch)
+                if len(eval_batches) == 2:
+                    break
+            if False in eval_batches:
+                self.sharded_evaluation_step_function_language = compile_function(
+                    self.sharded_evaluation_step_function_language,
+                    eval_batches[False],
+                    self.model_state,
+                    "trainer.sharded_evaluation_step_function_language",
+                    self._eval_shared_fn_extra_args,
+                    self._eval_shared_fn_static_args,
+                )
+                compiled = True
+            if True in eval_batches:
+                self.sharded_evaluation_step_function_vision = compile_function(
+                    self.sharded_evaluation_step_function_vision,
+                    eval_batches[True],
+                    self.model_state,
+                    "trainer.sharded_evaluation_step_function_vision",
+                    self._eval_shared_fn_extra_args,
+                    self._eval_shared_fn_static_args,
+                )
+                compiled = True
+            self.sharded_evaluation_step_function = self.sharded_evaluation_step_function_vision
+
+        return compiled
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[EasyDeLState]:

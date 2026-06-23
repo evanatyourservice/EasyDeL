@@ -390,7 +390,8 @@ def collate_packed_embeds(
     Image embeds are decoded and concatenated in EXAMPLE order (== the row-major placeholder scan of
     the flattened ``(n_windows, seq_len)`` batch) and zero-padded to ``max_embed_rows``;
     ``image_grid_thw`` concatenated likewise. ASSERTS #image-placeholder tokens == #decoded embed
-    rows so the scatter target stays aligned.
+    rows so the scatter target stays aligned. All-text batches omit ``image_embeds`` and its
+    companion side-channel tensors entirely so language-only training steps take the text path.
 
     The per-row admission guards (``len(input_ids) <= seq_len`` and ``embed_rows <= max_embed_rows``)
     live on the packer (:meth:`EmbedsWindowPacker.push`); the defensive per-window capacity assert
@@ -430,9 +431,7 @@ def collate_packed_embeds(
     position_ids = np.zeros((3, n_windows, seq_len), dtype=np.int32)
 
     embeds_list, grids = [], []
-    image_embed_positions = np.zeros((max_embed_rows, 2), dtype=np.int32)
-    image_embed_mask = np.zeros((max_embed_rows,), dtype=np.int32)
-    embed_cursor = 0
+    image_embed_position_rows: list[tuple[int, int]] = []
     for wi, pack in enumerate(packs):
         offset = 0
         for seg_idx, r in enumerate(pack):
@@ -451,7 +450,7 @@ def collate_packed_embeds(
             # Per-example reset 3D M-RoPE: run the caller's model helper on THIS example alone,
             # then drop the result into the window slice. The generic collator only marks image
             # placeholders; model-family details live in ``position_id_fn``.
-            grid = np.asarray(r["image_grid_thw"], dtype=np.int32).reshape(-1, 3)
+            grid = np.asarray(r.get("image_grid_thw", []), dtype=np.int32).reshape(-1, 3)
             has_images = bool(np.any(ids == image_token_id))
             if has_images:
                 if position_id_fn is None:
@@ -473,44 +472,58 @@ def collate_packed_embeds(
                 example_positions = np.arange(length, dtype=np.int32).reshape(1, 1, -1).repeat(3, axis=0)
             position_ids[:, wi, window_slice] = np.asarray(example_positions)[:, 0, :]
 
-            embeds_list.append(_decode_row_embeds(r, embed_dim, resolved_dtype))
-            grids.append(grid)
             place_positions = np.flatnonzero(ids == image_token_id).astype(np.int32, copy=False)
             n_place = place_positions.shape[0]
-            image_embed_positions[embed_cursor : embed_cursor + n_place, 0] = wi
-            image_embed_positions[embed_cursor : embed_cursor + n_place, 1] = offset + place_positions
-            image_embed_mask[embed_cursor : embed_cursor + n_place] = 1
-            embed_cursor += n_place
+            if has_images:
+                embeds_list.append(_decode_row_embeds(r, embed_dim, resolved_dtype))
+                grids.append(grid)
+                image_embed_position_rows.extend((wi, int(offset + pos)) for pos in place_positions)
             offset += length
 
     flat_rows = [r for pack in packs for r in pack]
+    n_place = int((input_ids == image_token_id).sum())
+
+    result = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "segment_ids": segment_ids,
+        "position_ids": position_ids,
+        "n_real_embeds": 0,
+    }
+
+    if n_place == 0:
+        return result
+
     resolved_embed_dim = _infer_batch_embed_dim(flat_rows, embeds_list, embed_dim)
     all_embeds = (
         np.concatenate(embeds_list, axis=0) if embeds_list else np.zeros((0, resolved_embed_dim), resolved_dtype)
     )
     n_real = all_embeds.shape[0]
-    n_place = int((input_ids == image_token_id).sum())
     assert n_place == n_real, (
         f"placeholder/embed mismatch: {n_place} image-placeholder tokens but {n_real} decoded embed "
         "rows -- packing must preserve the per-example placeholder<->embed alignment"
     )
+    embed_cursor = len(image_embed_position_rows)
     assert embed_cursor == n_real, (
         f"placeholder/embed metadata mismatch: {embed_cursor} coordinate rows but {n_real} decoded embed rows"
     )
     assert n_real <= max_embed_rows, f"decoded embed rows {n_real} exceed max_embed_rows {max_embed_rows}"
     padded = np.zeros((max_embed_rows, resolved_embed_dim), dtype=resolved_dtype)
     padded[:n_real] = all_embeds
+    image_embed_positions = np.zeros((max_embed_rows, 2), dtype=np.int32)
+    image_embed_mask = np.zeros((max_embed_rows,), dtype=np.int32)
+    image_embed_positions[:embed_cursor] = np.asarray(image_embed_position_rows, dtype=np.int32)
+    image_embed_mask[:embed_cursor] = 1
     grid_thw = np.concatenate(grids, axis=0) if grids else np.zeros((0, 3), np.int32)
 
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "segment_ids": segment_ids,
-        "position_ids": position_ids,
-        "image_embeds": padded,
-        "image_embed_positions": image_embed_positions,
-        "image_embed_mask": image_embed_mask,
-        "image_grid_thw": grid_thw,
-        "n_real_embeds": n_real,
-    }
+    result.update(
+        {
+            "image_embeds": padded,
+            "image_embed_positions": image_embed_positions,
+            "image_embed_mask": image_embed_mask,
+            "image_grid_thw": grid_thw,
+            "n_real_embeds": n_real,
+        }
+    )
+    return result

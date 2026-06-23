@@ -399,6 +399,12 @@ class MixStageConfig:
             exhausted (``"all_exhausted"``).
         seed (int | None): RNG seed for the mixer's per-block sampler;
             making mixing deterministic across runs/processes when set.
+        batch_size (int | None): Batch size used by batch-homogeneous mixing.
+        vision_sources (list[str] | None): Source names treated as vision
+            sources when :attr:`vision_batch_interval` is set.
+        vision_batch_interval (int | None): When set, every Nth batch is
+            drawn wholly from :attr:`vision_sources`; other batches are
+            drawn from the remaining sources.
     """
 
     weights: dict[str, float] | None = None
@@ -407,6 +413,9 @@ class MixStageConfig:
     block_size: int = 1000
     stop_strategy: Literal["restart", "first_exhausted", "all_exhausted"] = "restart"
     seed: int | None = None
+    batch_size: int | None = None
+    vision_sources: list[str] | None = None
+    vision_batch_interval: int | None = None
 
     def __post_init__(self):
         """Verify ``weights`` (if provided) forms a valid probability vector.

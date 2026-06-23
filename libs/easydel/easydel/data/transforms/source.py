@@ -144,6 +144,13 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         """
         return self._source.get_shard_info(shard_name)
 
+    def with_batch_size(self, batch_size: int) -> "TransformedShardedSource":
+        """Forward trainer-known batch size to wrapped sources that support it."""
+        with_batch_size = getattr(self._source, "with_batch_size", None)
+        if not callable(with_batch_size):
+            return self
+        return type(self)(with_batch_size(batch_size), self._transform)
+
     def __len__(self) -> int:
         """Return length of the underlying source.
 

@@ -152,6 +152,7 @@ from .sources import (
 from .transforms import (
     # Base
     AddField,
+    BatchHomogeneousMixedShardedSource,
     ChainedTransform,
     ChatTemplateTransform,
     CombineFields,
@@ -197,6 +198,7 @@ from .transforms import (
 # Trainer-specific transforms (lazy import from trainers to avoid circular imports)
 _TRAINER_TRANSFORMS = {
     "BCOPreprocessTransform",
+    "BatchHomogeneousMixedShardedSource",
     "CPOPreprocessTransform",
     "DPOPreprocessTransform",
     "GRPOPreprocessTransform",

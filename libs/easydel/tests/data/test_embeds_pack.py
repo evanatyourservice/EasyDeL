@@ -1420,6 +1420,19 @@ def test_collate_packed_embeds_multiwindow():
         collate_packed_embeds(packs, pad_id=0, seq_len=seq_len, max_embed_rows=0, n_windows=1)
 
 
+def test_collate_packed_embeds_all_text_omits_image_sidechannels():
+    rows = [_packable_row(text_len=8, imgs=[]), _packable_row(text_len=5, imgs=[])]
+    seq_len = 20
+    out = collate_packed_embeds([rows], pad_id=0, seq_len=seq_len, max_embed_rows=8192, n_windows=2)
+
+    assert np.asarray(out["input_ids"]).shape == (2, seq_len)
+    assert np.asarray(out["segment_ids"]).shape == (2, seq_len)
+    assert np.asarray(out["position_ids"]).shape == (3, 2, seq_len)
+    assert out["n_real_embeds"] == 0
+    for key in ("image_embeds", "image_embed_positions", "image_embed_mask", "image_grid_thw"):
+        assert key not in out
+
+
 def test_collate_packed_embeds_underfill():
     """Static leading dim: when greedy packing yields fewer windows than ``n_windows`` the batch is
     STILL ``(n_windows, seq_len)`` and the trailing ``n_windows - M`` windows are emitted whole-padded

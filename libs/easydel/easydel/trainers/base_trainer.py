@@ -5012,6 +5012,9 @@ class BaseTrainer(BaseTrainerProtocol):
         Yields:
             Lists of examples (pre-tokenized dicts) to be collated.
         """
+        with_batch_size = getattr(source, "with_batch_size", None)
+        if callable(with_batch_size):
+            source = with_batch_size(batch_size)
         skip_examples = max(int(skip_batches), 0) * int(batch_size)
         for _ in range(num_epochs):
             batch = []

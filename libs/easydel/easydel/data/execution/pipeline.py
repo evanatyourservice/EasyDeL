@@ -40,7 +40,7 @@ from ..core.config import (
     TokenizeStageConfig,
 )
 from ..core.protocols import PipelineContext, ShardedDataSource
-from ..core.types import DatasetMixture, TextDatasetInform
+from ..core.types import DatasetMixture, TextDatasetInform, VisualDatasetInform
 from ..sources import create_source, load_for_inform
 from ..transforms.base import ExpandTransform
 from ..transforms.mixture import MixStage, block_mixture_interleave
@@ -1346,9 +1346,10 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
         >>> dataset = build_dataset(mixture)
     """
     per_ds = []
+    vision_indices = []
     content_target = mixture.text_target_field
 
-    for inform in mixture.informs:
+    for inform_idx, inform in enumerate(mixture.informs):
         ds = load_for_inform(inform, mixture)
 
         if getattr(inform, "format_fields", None):
@@ -1466,18 +1467,25 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 pass
 
         per_ds.append(ds)
+        if isinstance(inform, VisualDatasetInform):
+            vision_indices.append(inform_idx)
 
     if mixture.streaming:
         if getattr(mixture, "block_mixture", False):
             weights = None
             if mixture.mixture_weights and len(mixture.mixture_weights) == len(per_ds):
                 weights = mixture.mixture_weights
+                if isinstance(weights, dict):
+                    weights = list(weights.values())
             mixed = block_mixture_interleave(
                 per_ds,
                 weights=weights,
                 block_size=getattr(mixture, "mixture_block_size", 2048),
                 seed=mixture.seed or 0,
                 stop=getattr(mixture, "stop_strategy", "restart"),
+                batch_size=mixture.batch_size if getattr(mixture, "vision_batch_interval", None) else None,
+                vision_indices=vision_indices if getattr(mixture, "vision_batch_interval", None) else None,
+                vision_batch_interval=getattr(mixture, "vision_batch_interval", None),
             )
         else:
             from datasets import interleave_datasets  # pyright: ignore[reportMissingTypeStubs]

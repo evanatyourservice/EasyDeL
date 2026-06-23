@@ -41,6 +41,7 @@ from .field_ops import (
 from .filter_ops import FilterByField, FilterNonEmpty, FilterTransform
 from .map_ops import MapField, MapTransform
 from .mixture import (
+    BatchHomogeneousMixedShardedSource,
     MixedShardedSource,
     MixedShardState,
     MixStage,
@@ -74,6 +75,7 @@ from .tokenize import (
 # Use lazy imports for backwards compatibility to avoid circular imports
 _TRAINER_TRANSFORMS = {
     "BCOPreprocessTransform",
+    "BatchHomogeneousMixedShardedSource",
     "CPOPreprocessTransform",
     "DPOPreprocessTransform",
     "GRPOPreprocessTransform",

@@ -4,7 +4,7 @@ from collections.abc import Iterator, Sequence
 
 from easydel.data import ShuffledShardedSource
 from easydel.data.core.protocols import ShardedDataSource
-from easydel.data.transforms.mixture import MixedShardedSource
+from easydel.data.transforms.mixture import BatchHomogeneousMixedShardedSource, MixedShardedSource
 
 
 class ListSource(ShardedDataSource[dict]):
@@ -110,3 +110,26 @@ def test_mix_then_shuffle_preserves_weights_and_source_tags():
     # Output is decorrelated from file order (the bug being fixed: mixed-but-not-shuffled).
     texts = [r["text"] for r in rows]
     assert texts[:8] != [f"B{i}" for i in range(8)]
+
+
+def test_batch_homogeneous_mixer_emits_whole_modality_batches():
+    text_a = ListSource([{"kind": "text", "id": f"A{i}"} for i in range(30)])
+    text_b = ListSource([{"kind": "text", "id": f"B{i}"} for i in range(30)])
+    vision = ListSource([{"kind": "vision", "id": f"V{i}"} for i in range(30)])
+    mixed = BatchHomogeneousMixedShardedSource(
+        {"text_a": text_a, "text_b": text_b, "vision": vision},
+        vision_sources=["vision"],
+        weights={"text_a": 1, "text_b": 1, "vision": 1},
+        batch_size=4,
+        vision_batch_interval=3,
+        seed=7,
+        stop_strategy="restart",
+    )
+    it = mixed.open_shard("homogeneous_mixed_shard_0")
+    rows = [next(it) for _ in range(16)]
+    batches = [rows[i : i + 4] for i in range(0, len(rows), 4)]
+
+    assert [batch[0]["kind"] for batch in batches] == ["vision", "text", "text", "vision"]
+    for batch in batches:
+        assert len({row["kind"] for row in batch}) == 1
+        assert all("__source__" in row for row in batch)
